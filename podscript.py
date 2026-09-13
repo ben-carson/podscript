@@ -145,15 +145,27 @@ def clean_youtube_url(url: str) -> str:
         return url
 
 
-def download_youtube_audio(url: str) -> dict:
+def download_youtube_audio(
+    url: str,
+    *,
+    cookies_from_browser: str | None = None,
+    js_runtime: str | None = None,
+) -> dict:
     """Download audio from YouTube, return dict with title, channel, duration, audio_path."""
     yt_dlp = get_yt_dlp_cmd()
     clean_url = clean_youtube_url(url)
+    # Recent yt-dlp versions need the official EJS challenge solver for some
+    # YouTube videos. Allow yt-dlp to fetch it from the official repository.
+    yt_options = ["--remote-components", "ejs:github"]
+    if cookies_from_browser:
+        yt_options.extend(["--cookies-from-browser", cookies_from_browser])
+    if js_runtime:
+        yt_options.extend(["--js-runtimes", js_runtime])
 
     # Get metadata
     print("Fetching video info...\n")
     result = subprocess.run(
-        [*yt_dlp.split(), "--no-download", "--dump-json", clean_url],
+        [*yt_dlp.split(), "--no-download", "--dump-json", *yt_options, clean_url],
         capture_output=True,
         text=True,
         timeout=60,
@@ -177,7 +189,18 @@ def download_youtube_audio(url: str) -> dict:
 
     print("Downloading audio...")
     subprocess.run(
-        [*yt_dlp.split(), "-x", "--audio-format", "mp3", "--audio-quality", "0", "-o", temp_output, clean_url],
+        [
+            *yt_dlp.split(),
+            *yt_options,
+            "-x",
+            "--audio-format",
+            "mp3",
+            "--audio-quality",
+            "0",
+            "-o",
+            temp_output,
+            clean_url,
+        ],
         timeout=600,
         check=True,
     )
@@ -453,6 +476,23 @@ def group_into_segments(words: list[dict]) -> list[TranscriptSegment]:
 # ── Local (Whisper) transcription ──────────────────────────────────────────
 
 
+def _configure_cuda_library_path() -> None:
+    """Expose CUDA wheels in the virtual environment to native libraries."""
+    if not sys.platform.startswith("linux"):
+        return
+
+    site_packages = Path(sys.prefix) / "lib"
+    cuda_library_dirs = [
+        str(path)
+        for path in site_packages.glob("python*/site-packages/nvidia/*/lib")
+        if path.is_dir()
+    ]
+    if cuda_library_dirs:
+        current = os.environ.get("LD_LIBRARY_PATH", "")
+        paths = cuda_library_dirs + ([current] if current else [])
+        os.environ["LD_LIBRARY_PATH"] = ":".join(paths)
+
+
 def transcribe_local(
     source: str,
     *,
@@ -472,6 +512,8 @@ def transcribe_local(
     Returns:
         (segments, duration_seconds)
     """
+    _configure_cuda_library_path()
+
     try:
         from faster_whisper import WhisperModel
     except ImportError:
@@ -729,6 +771,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Whisper model size (default: base). Only used with --local",
     )
     parser.add_argument("--hf-token", metavar="TOKEN", help="HuggingFace token for pyannote speaker diarization")
+    parser.add_argument(
+        "--cookies-from-browser",
+        metavar="BROWSER",
+        help="Use cookies from a browser for YouTube (e.g. chrome, firefox)",
+    )
+    parser.add_argument(
+        "--js-runtime",
+        metavar="RUNTIME",
+        help="JavaScript runtime for YouTube extraction (e.g. deno, bun)",
+    )
     return parser
 
 
@@ -783,7 +835,11 @@ def main():
         if provider != "local":
             require_api_key()
         print("\nDetected YouTube URL\n")
-        yt = download_youtube_audio(url)
+        yt = download_youtube_audio(
+            url,
+            cookies_from_browser=args.cookies_from_browser,
+            js_runtime=args.js_runtime,
+        )
 
         print("Starting transcription...")
         print("This may take several minutes depending on video length.\n")

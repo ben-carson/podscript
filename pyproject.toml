@@ -37,3 +37,6 @@ Issues = "https://github.com/timf34/podscript/issues"
 
 [project.scripts]
 podscript = "podscript:main"
+
+[tool.setuptools]
+py-modules = ["podscript"]
