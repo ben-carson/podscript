@@ -6,6 +6,7 @@ import html
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -14,6 +15,7 @@ import unicodedata
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import Callable
 
 from urllib.parse import urlparse, parse_qs
 
@@ -23,6 +25,10 @@ from dotenv import load_dotenv
 
 # Constants
 ELEVENLABS_API_URL = "https://api.elevenlabs.io/v1/speech-to-text"
+OPENAI_API_URL = "https://api.openai.com/v1/audio/transcriptions"
+ASSEMBLYAI_UPLOAD_URL = "https://api.assemblyai.com/v2/upload"
+ASSEMBLYAI_TRANSCRIPT_URL = "https://api.assemblyai.com/v2/transcript"
+OPENAI_CHUNK_SECONDS = 600
 PAUSE_THRESHOLD = 1.0  # seconds - gap that triggers new segment
 
 
@@ -42,6 +48,24 @@ class TranscriptSegment:
     text: str
     start: float
     end: float
+
+
+@dataclass(frozen=True)
+class ProviderSpec:
+    """Configuration metadata for one transcription backend."""
+
+    name: str
+    label: str
+    api_key_env: str | None
+    supports_diarization: bool
+
+
+PROVIDER_SPECS = {
+    "local": ProviderSpec("local", "Local Whisper", None, True),
+    "elevenlabs": ProviderSpec("elevenlabs", "ElevenLabs Scribe", "ELEVENLABS_API_KEY", True),
+    "openai": ProviderSpec("openai", "OpenAI transcription", "OPENAI_API_KEY", False),
+    "assemblyai": ProviderSpec("assemblyai", "AssemblyAI", "ASSEMBLYAI_API_KEY", True),
+}
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -382,9 +406,23 @@ def transcribe(
     Returns:
         (segments, duration_seconds)
     """
+    handlers: dict[str, Callable[..., tuple[list[TranscriptSegment], float]]] = {
+        "local": transcribe_local,
+        "elevenlabs": transcribe_elevenlabs,
+        "openai": transcribe_openai,
+        "assemblyai": transcribe_assemblyai,
+    }
+    if provider not in handlers:
+        supported = ", ".join(handlers)
+        raise ValueError(f"Unknown transcription provider {provider!r}. Choose from: {supported}")
     if provider == "local":
-        return transcribe_local(source, is_file=is_file, model_size=whisper_model, hf_token=hf_token)
-    return transcribe_elevenlabs(source, is_file=is_file)
+        return handlers[provider](
+            source,
+            is_file=is_file,
+            model_size=whisper_model,
+            hf_token=hf_token,
+        )
+    return handlers[provider](source, is_file=is_file)
 
 
 def transcribe_elevenlabs(source: str, *, is_file: bool = False) -> tuple[list[TranscriptSegment], float]:
@@ -437,6 +475,284 @@ def transcribe_elevenlabs(source: str, *, is_file: bool = False) -> tuple[list[T
     duration = words[-1]["end"] if words else 0.0
 
     return segments, duration
+
+
+def _require_provider_api_key(provider: str) -> str:
+    """Return a provider API key or exit with an actionable message."""
+    spec = PROVIDER_SPECS[provider]
+    if not spec.api_key_env:
+        raise ValueError(f"Provider {provider!r} does not use an API key")
+    api_key = os.environ.get(spec.api_key_env, "")
+    if not api_key:
+        print(
+            f"Error: {spec.api_key_env} not found for the {spec.label} provider.\n"
+            f"Set it in the environment, for example: export {spec.api_key_env}=...",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    return api_key
+
+
+def _download_audio_to_temp(source: str, *, suffix: str = ".mp3") -> tuple[str, str]:
+    """Download a remote audio URL and return (path, temporary_path)."""
+    fd, temp_path = tempfile.mkstemp(
+        prefix=f"podscript-provider-{os.getpid()}-",
+        suffix=suffix,
+    )
+    os.close(fd)
+    try:
+        response = requests.get(source, timeout=600, stream=True)
+        response.raise_for_status()
+        with open(temp_path, "wb") as audio_file:
+            for chunk in response.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    audio_file.write(chunk)
+        return temp_path, temp_path
+    except Exception:
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
+        raise
+
+
+def _audio_path_for_provider(source: str, *, is_file: bool) -> tuple[str, str | None]:
+    """Return a local audio path and an optional path owned by this call."""
+    if is_file:
+        return source, None
+    return _download_audio_to_temp(source)
+
+
+def _prepare_openai_chunks(audio_path: str) -> tuple[str, list[str]]:
+    """Create ten-minute MP3 chunks below hosted API file-size limits."""
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise RuntimeError("ffmpeg is required for OpenAI long-audio transcription")
+
+    temp_dir = tempfile.mkdtemp(prefix=f"podscript-openai-{os.getpid()}-")
+    pattern = os.path.join(temp_dir, "chunk-%05d.mp3")
+    try:
+        subprocess.run(
+            [
+                ffmpeg,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-i",
+                audio_path,
+                "-f",
+                "segment",
+                "-segment_time",
+                str(OPENAI_CHUNK_SECONDS),
+                "-reset_timestamps",
+                "1",
+                "-c:a",
+                "libmp3lame",
+                "-b:a",
+                "128k",
+                pattern,
+            ],
+            check=True,
+            timeout=600,
+        )
+        chunks = sorted(
+            os.path.join(temp_dir, name)
+            for name in os.listdir(temp_dir)
+            if name.endswith(".mp3")
+        )
+        if not chunks:
+            raise RuntimeError("ffmpeg produced no audio chunks")
+        return temp_dir, chunks
+    except Exception:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise
+
+
+def _media_duration(audio_path: str) -> float:
+    """Read media duration with ffprobe for accurate chunk timestamp offsets."""
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        return OPENAI_CHUNK_SECONDS
+    result = subprocess.run(
+        [
+            ffprobe,
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            audio_path,
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=60,
+    )
+    return float(result.stdout.strip())
+
+
+def _openai_words(body: dict, offset: float) -> list[dict]:
+    """Normalize an OpenAI verbose response into Podscript word records."""
+    words = body.get("words") or []
+    if words:
+        return [
+            {
+                "text": word.get("word", "").strip(),
+                "start": float(word.get("start", 0)) + offset,
+                "end": float(word.get("end", 0)) + offset,
+                "speaker_id": "speaker_0",
+            }
+            for word in words
+            if word.get("word")
+        ]
+
+    # Some compatible OpenAI endpoints return segment timestamps only.
+    return [
+        {
+            "text": segment.get("text", "").strip(),
+            "start": float(segment.get("start", 0)) + offset,
+            "end": float(segment.get("end", 0)) + offset,
+            "speaker_id": "speaker_0",
+        }
+        for segment in body.get("segments", [])
+        if segment.get("text")
+    ]
+
+
+def transcribe_openai(source: str, *, is_file: bool = False) -> tuple[list[TranscriptSegment], float]:
+    """Transcribe audio with OpenAI's hosted Whisper endpoint in chunks."""
+    api_key = _require_provider_api_key("openai")
+    audio_path, owned_path = _audio_path_for_provider(source, is_file=is_file)
+    chunk_dir = None
+    try:
+        chunk_dir, chunks = _prepare_openai_chunks(audio_path)
+        model = os.environ.get("OPENAI_TRANSCRIPTION_MODEL", "whisper-1")
+        words: list[dict] = []
+        offset = 0.0
+        for index, chunk_path in enumerate(chunks, start=1):
+            print(f"Transcribing OpenAI chunk {index}/{len(chunks)}...")
+            with open(chunk_path, "rb") as audio_file:
+                response = requests.post(
+                    OPENAI_API_URL,
+                    headers={"Authorization": f"Bearer {api_key}"},
+                    files={"file": (os.path.basename(chunk_path), audio_file, "audio/mpeg")},
+                    data=[
+                        ("model", model),
+                        ("response_format", "verbose_json"),
+                        ("timestamp_granularities[]", "word"),
+                    ],
+                    timeout=1800,
+                )
+            if response.status_code >= 400:
+                print(f"OpenAI transcription error ({response.status_code}): {response.text}", file=sys.stderr)
+                sys.exit(1)
+            body = response.json()
+            words.extend(_openai_words(body, offset))
+            offset += _media_duration(chunk_path)
+
+        segments = group_into_segments(words)
+        duration = max((word["end"] for word in words), default=offset)
+        return segments, duration
+    finally:
+        if chunk_dir:
+            shutil.rmtree(chunk_dir, ignore_errors=True)
+        if owned_path:
+            try:
+                os.unlink(owned_path)
+            except OSError:
+                pass
+
+
+def _assemblyai_speaker_id(label: str, speakers: dict[str, str]) -> str:
+    """Normalize AssemblyAI labels such as A/B into speaker_0/speaker_1."""
+    if label not in speakers:
+        speakers[label] = f"speaker_{len(speakers)}"
+    return speakers[label]
+
+
+def _assemblyai_segments(body: dict) -> list[TranscriptSegment]:
+    """Normalize AssemblyAI utterances and word timestamps."""
+    speakers: dict[str, str] = {}
+    segments: list[TranscriptSegment] = []
+    for utterance in body.get("utterances") or []:
+        speaker = _assemblyai_speaker_id(str(utterance.get("speaker", "A")), speakers)
+        words = utterance.get("words") or []
+        if words:
+            normalized_words = [
+                {
+                    "text": word.get("text", "").strip(),
+                    "start": float(word.get("start", 0)) / 1000,
+                    "end": float(word.get("end", 0)) / 1000,
+                    "speaker_id": speaker,
+                }
+                for word in words
+                if word.get("text")
+            ]
+            segments.extend(group_into_segments(normalized_words))
+        elif utterance.get("text"):
+            segments.append(
+                TranscriptSegment(
+                    speaker=speaker,
+                    text=utterance["text"].strip(),
+                    start=float(utterance.get("start", 0)) / 1000,
+                    end=float(utterance.get("end", 0)) / 1000,
+                )
+            )
+    return segments
+
+
+def transcribe_assemblyai(source: str, *, is_file: bool = False) -> tuple[list[TranscriptSegment], float]:
+    """Transcribe and diarize audio with AssemblyAI."""
+    api_key = _require_provider_api_key("assemblyai")
+    audio_path, owned_path = _audio_path_for_provider(source, is_file=is_file)
+    headers = {"authorization": api_key}
+    try:
+        print("Uploading audio to AssemblyAI...")
+        with open(audio_path, "rb") as audio_file:
+            upload = requests.post(
+                ASSEMBLYAI_UPLOAD_URL,
+                headers={**headers, "content-type": "application/octet-stream"},
+                data=audio_file,
+                timeout=1800,
+            )
+        upload.raise_for_status()
+        audio_url = upload.json()["upload_url"]
+
+        transcript_options = {"speaker_labels": True}
+        speech_model = os.environ.get("ASSEMBLYAI_SPEECH_MODEL")
+        if speech_model:
+            transcript_options["speech_model"] = speech_model
+        create = requests.post(
+            ASSEMBLYAI_TRANSCRIPT_URL,
+            headers={**headers, "content-type": "application/json"},
+            json={"audio_url": audio_url, **transcript_options},
+            timeout=120,
+        )
+        create.raise_for_status()
+        transcript_id = create.json()["id"]
+        poll_url = f"{ASSEMBLYAI_TRANSCRIPT_URL}/{transcript_id}"
+        poll_interval = float(os.environ.get("ASSEMBLYAI_POLL_INTERVAL", "5"))
+        print("AssemblyAI is transcribing and diarizing...")
+        while True:
+            time.sleep(poll_interval)
+            result = requests.get(poll_url, headers=headers, timeout=120)
+            result.raise_for_status()
+            body = result.json()
+            status = body.get("status")
+            if status == "completed":
+                segments = _assemblyai_segments(body)
+                duration = float(body.get("audio_duration") or 0)
+                return segments, duration
+            if status == "error":
+                raise RuntimeError(f"AssemblyAI transcription failed: {body.get('error', 'unknown error')}")
+    finally:
+        if owned_path:
+            try:
+                os.unlink(owned_path)
+            except OSError:
+                pass
 
 
 def group_into_segments(words: list[dict]) -> list[TranscriptSegment]:
@@ -540,11 +856,6 @@ def transcribe_local(
         print(f"Downloaded: {size_mb:.1f} MB\n")
         audio_path = temp_path
 
-    # Validate HF token access upfront before spending time on transcription
-    diarize_pipeline = None
-    if hf_token:
-        diarize_pipeline = _load_diarization_pipeline(hf_token)
-
     try:
         # Auto-detect device and compute type
         import torch
@@ -576,9 +887,22 @@ def transcribe_local(
 
         duration = info.duration
 
-        # Run diarization if pipeline was loaded successfully
-        if diarize_pipeline and words:
-            words = _diarize_local(audio_path, words, diarize_pipeline)
+        # Load diarization only after Whisper has finished. Loading both GPU
+        # models at once causes out-of-memory failures on smaller GPUs.
+        if hf_token and words:
+            # Whisper and pyannote both use substantial GPU memory. Release
+            # Whisper before running diarization so smaller GPUs can support
+            # both stages sequentially.
+            del segments_iter
+            del model
+            import gc
+
+            gc.collect()
+            if device == "cuda":
+                torch.cuda.empty_cache()
+            diarize_pipeline = _load_diarization_pipeline(hf_token)
+            if diarize_pipeline:
+                words = _diarize_local(audio_path, words, diarize_pipeline)
 
         segments = group_into_segments(words)
         return segments, duration
@@ -593,7 +917,7 @@ def transcribe_local(
 
 def _load_diarization_pipeline(hf_token: str):
     """
-    Load the pyannote diarization pipeline upfront, validating access before transcription.
+    Load the pyannote diarization pipeline after Whisper has released its memory.
 
     Returns the pipeline if successful, or None if loading fails.
     """
@@ -675,8 +999,12 @@ def _diarize_local(audio_path: str, words: list[dict], pipeline) -> list[dict]:
         Updated word list with speaker_id set from diarization.
     """
     print("Running speaker diarization...")
+    diarization_audio_path = None
     try:
-        diarization = pipeline(audio_path)
+        diarization_audio_path = _prepare_diarization_audio(audio_path)
+        if diarization_audio_path is None:
+            return words
+        diarization = pipeline(diarization_audio_path)
     except Exception as e:
         print(
             f"Warning: Speaker diarization failed: {e}\n"
@@ -684,6 +1012,12 @@ def _diarize_local(audio_path: str, words: list[dict], pipeline) -> list[dict]:
             file=sys.stderr,
         )
         return words
+    finally:
+        if diarization_audio_path:
+            try:
+                os.unlink(diarization_audio_path)
+            except OSError:
+                pass
 
     # Build list of (start, end, speaker) turns
     turns = []
@@ -702,6 +1036,59 @@ def _diarize_local(audio_path: str, words: list[dict], pipeline) -> list[dict]:
 
     print("Diarization complete.\n")
     return words
+
+
+def _prepare_diarization_audio(audio_path: str) -> str | None:
+    """Convert audio to sample-accurate mono 16 kHz PCM WAV for pyannote."""
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        print(
+            "Warning: ffmpeg is not available for speaker diarization.\n"
+            "Install ffmpeg and retry. All speech will be attributed to Speaker 1.",
+            file=sys.stderr,
+        )
+        return None
+
+    fd, wav_path = tempfile.mkstemp(
+        prefix=f"podscript-diarization-{os.getpid()}-",
+        suffix=".wav",
+    )
+    os.close(fd)
+    try:
+        print("Preparing audio for speaker diarization...")
+        subprocess.run(
+            [
+                ffmpeg,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-i",
+                audio_path,
+                "-vn",
+                "-ac",
+                "1",
+                "-ar",
+                "16000",
+                "-c:a",
+                "pcm_s16le",
+                wav_path,
+            ],
+            check=True,
+            timeout=600,
+        )
+        return wav_path
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+        print(
+            f"Warning: Failed to prepare audio for speaker diarization: {e}\n"
+            "All speech will be attributed to Speaker 1.",
+            file=sys.stderr,
+        )
+        try:
+            os.unlink(wav_path)
+        except OSError:
+            pass
+        return None
 
 
 # ── Markdown generation ─────────────────────────────────────────────────────
@@ -754,7 +1141,7 @@ CONFIG_FILE = CONFIG_DIR / ".env"
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="podscript",
-        description="Transcribe podcasts and YouTube videos using ElevenLabs Scribe API.",
+        description="Transcribe podcasts and YouTube videos with hosted or local speech models.",
     )
     parser.add_argument("url", nargs="?", help="RSS feed URL, YouTube URL, or Apple Podcasts URL")
     parser.add_argument("--setup", action="store_true", help="Save your ElevenLabs API key")
@@ -763,12 +1150,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--latest", action="store_true", help="Transcribe the most recent episode (default)")
     parser.add_argument("--list", action="store_true", dest="list_episodes", help="List episodes without transcribing")
     parser.add_argument("--output", metavar="FILE", help="Output filename (default: auto-generated)")
-    parser.add_argument("--local", action="store_true", help="Use local Whisper model instead of ElevenLabs")
+    parser.add_argument(
+        "--provider",
+        choices=list(PROVIDER_SPECS),
+        default="elevenlabs",
+        help="Transcription backend (default: elevenlabs)",
+    )
+    parser.add_argument(
+        "--local",
+        action="store_true",
+        help="Compatibility alias for --provider local",
+    )
     parser.add_argument(
         "--model",
         choices=["tiny", "base", "small", "medium", "large-v2", "large-v3"],
         default="base",
-        help="Whisper model size (default: base). Only used with --local",
+        help="Local Whisper model size (default: base). Only used with --provider local",
     )
     parser.add_argument("--hf-token", metavar="TOKEN", help="HuggingFace token for pyannote speaker diarization")
     parser.add_argument(
@@ -826,13 +1223,13 @@ def main():
         sys.exit(1)
 
     url: str = args.url
-    provider = "local" if args.local else "elevenlabs"
+    provider = "local" if args.local else args.provider
     hf_token = getattr(args, "hf_token", None) or os.environ.get("HF_TOKEN")
     whisper_model = args.model
 
     # ── YouTube path ─────────────────────────────────────────────────────
     if is_youtube_url(url):
-        if provider != "local":
+        if provider == "elevenlabs":
             require_api_key()
         print("\nDetected YouTube URL\n")
         yt = download_youtube_audio(
@@ -972,7 +1369,7 @@ def main():
     if args.list_episodes or (args.search and args.episode is None and not apple_episode_id):
         return
 
-    if provider != "local":
+    if provider == "elevenlabs":
         require_api_key()
 
     # Select episode

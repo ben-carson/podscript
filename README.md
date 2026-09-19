@@ -2,7 +2,7 @@
 
 *Podcast → Transcript!*
 
-Transcribe any podcast episode or YouTube video from the command line. Generates clean markdown with speaker diarization and timestamps. Works with the [ElevenLabs API](https://elevenlabs.io/) or **fully locally** using [Whisper](https://github.com/SYSTRAN/faster-whisper) - no API key required.
+Transcribe any podcast episode or YouTube video from the command line. Generates clean markdown with speaker labels and timestamps. Choose a hosted provider such as [AssemblyAI](https://www.assemblyai.com/), [OpenAI](https://platform.openai.com/), or [ElevenLabs](https://elevenlabs.io/), or run **fully locally** with [Whisper](https://github.com/SYSTRAN/faster-whisper).
 
 <div align="center">
     <img src="./assets/image.png" alt="Podscript - Podcast to Transcript" width="600" />
@@ -32,6 +32,7 @@ python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -e ".[local]"
 python -m pip install yt-dlp
+cp .env.example .env
 ```
 
 On Ubuntu or Debian, install FFmpeg system-wide:
@@ -49,6 +50,8 @@ podscript --help
 
 If `podscript` is not found, run `source .venv/bin/activate` from the repository root.
 
+`.env` is loaded automatically from the repository directory. Fill in only the API key for the provider you plan to use. Keep `.env` private; it is ignored by Git.
+
 ## Usage
 
 ```bash
@@ -57,6 +60,12 @@ podscript "https://podcasts.apple.com/us/podcast/huberman-lab/id1545953110?i=100
 
 # Transcribe a YouTube video
 podscript "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+
+# Use AssemblyAI for long videos and hosted speaker diarization
+podscript "https://www.youtube.com/watch?v=..." --provider assemblyai
+
+# Use OpenAI hosted transcription without local GPU memory
+podscript "https://www.youtube.com/watch?v=..." --provider openai
 
 # Use an RSS feed directly
 podscript https://feeds.simplecast.com/JGE3yC0V
@@ -75,6 +84,52 @@ podscript https://feeds.simplecast.com/JGE3yC0V --latest --output transcript.md
 ```
 
 Without any flags, the default behavior is to transcribe the most recent episode.
+
+## Transcription providers
+
+Provider API keys are read from environment variables. The application does not require provider SDKs; it uses their HTTPS APIs through the existing `requests` dependency.
+
+| Provider | Flag | Environment variable | Speaker diarization | Long-video behavior |
+|---|---|---|---|---|
+| AssemblyAI | `--provider assemblyai` | `ASSEMBLYAI_API_KEY` | Yes, hosted | Uploads the full audio and polls for completion |
+| OpenAI | `--provider openai` | `OPENAI_API_KEY` | No with the standard Whisper endpoint | Splits audio into ten-minute chunks |
+| ElevenLabs | `--provider elevenlabs` | `ELEVENLABS_API_KEY` | Yes | Hosted transcription |
+| Local Whisper | `--provider local` or `--local` | Optional `HF_TOKEN` for pyannote | Optional, local pyannote | Uses local GPU/CPU memory |
+
+Set the key for the provider you choose:
+
+```bash
+export ASSEMBLYAI_API_KEY="..."
+# or:
+export OPENAI_API_KEY="..."
+# or:
+export ELEVENLABS_API_KEY="..."
+```
+
+For a long YouTube video on a small GPU, prefer AssemblyAI:
+
+```bash
+source .venv/bin/activate
+export ASSEMBLYAI_API_KEY="..."
+podscript "https://www.youtube.com/watch?v=..." \
+  --provider assemblyai \
+  --cookies-from-browser chrome \
+  --js-runtime bun \
+  --output transcript.md
+```
+
+This path does not load Whisper or pyannote, so the local GPU out-of-memory failure cannot occur. AssemblyAI's speaker labels are normalized into Podscript's `Speaker 1`, `Speaker 2`, and so on.
+
+OpenAI's hosted Whisper path avoids GPU use and automatically chunks audio before upload:
+
+```bash
+export OPENAI_API_KEY="..."
+podscript "https://www.youtube.com/watch?v=..." \
+  --provider openai \
+  --output transcript.md
+```
+
+OpenAI's standard Whisper endpoint returns timestamps but not speaker identities, so output is labeled `Speaker 1`.
 
 ## Output
 
@@ -113,10 +168,10 @@ This installs `faster-whisper`, `pyannote.audio`, and `torch`.
 
 ```bash
 # Basic local transcription (uses "base" model, no speaker diarization)
-podscript "https://www.youtube.com/watch?v=..." --local
+podscript "https://www.youtube.com/watch?v=..." --provider local
 
 # Use a larger model for better accuracy
-podscript "https://www.youtube.com/watch?v=..." --local --model medium
+podscript "https://www.youtube.com/watch?v=..." --provider local --model medium
 
 # If YouTube asks you to sign in or returns HTTP 429, use browser cookies
 # and a JavaScript runtime. Close the browser first.
@@ -180,6 +235,10 @@ Recent yt-dlp versions also use an external JavaScript challenge solver. Podscri
 The Hugging Face token only controls speaker diarization. It does not authenticate YouTube, and valid Hugging Face tokens use the `hf_...` prefix.
 
 If GPU transcription fails with a missing `libcublas.so.12`, ctranslate2/faster-whisper needs the CUDA 12 runtime libraries even when PyTorch installed CUDA 13 libraries. Install `nvidia-cublas-cu12` and `nvidia-cuda-runtime-cu12` in the virtual environment. Podscript configures the virtual-environment CUDA library path before loading Whisper.
+
+If diarization reports that a requested 10-second MP3 chunk contains a few samples too many or too few, this is an audio-decoder boundary issue. Podscript converts the audio to temporary mono 16 kHz PCM WAV before pyannote runs; make sure `ffmpeg` is available on `PATH`.
+
+On smaller GPUs, Podscript releases the Whisper model and clears the CUDA cache before running pyannote. If diarization still reports CUDA out-of-memory, rerun with `--model tiny` or omit `--hf-token` to skip diarization.
 
 ## License
 
