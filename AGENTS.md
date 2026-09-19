@@ -20,6 +20,8 @@ The local transcription stack requires `faster-whisper`, `pyannote.audio`, and `
 
 Hosted providers use the existing `requests` dependency and do not require provider SDKs. `ASSEMBLYAI_API_KEY`, `OPENAI_API_KEY`, and `ELEVENLABS_API_KEY` must never be printed or committed.
 
+The `.env` file may set `PODSCRIPT_PROVIDER`, `PODSCRIPT_MODEL`, `PODSCRIPT_COOKIES_FROM_BROWSER`, `PODSCRIPT_JS_RUNTIME`, and `PODSCRIPT_OUTPUT`. Empty values preserve defaults. CLI flags override these settings. Model names are provider-specific.
+
 On Linux, ctranslate2/faster-whisper may require CUDA 12 libraries even when the installed PyTorch wheel uses CUDA 13. In the validated working environment, `nvidia-cublas-cu12` and `nvidia-cuda-runtime-cu12` were installed manually, and `_configure_cuda_library_path()` exposes virtual-environment CUDA libraries before native Whisper libraries load. Fresh installs may need those packages when GPU loading reports a missing `libcublas.so.12`. Do not remove that setup without testing both CPU and GPU paths.
 
 ## YouTube lessons

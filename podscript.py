@@ -390,7 +390,7 @@ def transcribe(
     *,
     is_file: bool = False,
     provider: str = "elevenlabs",
-    whisper_model: str = "base",
+    whisper_model: str | None = None,
     hf_token: str | None = None,
 ) -> tuple[list[TranscriptSegment], float]:
     """
@@ -400,7 +400,7 @@ def transcribe(
         source: Either a cloud URL or a local file path.
         is_file: True if source is a local file path.
         provider: "elevenlabs" or "local".
-        whisper_model: Whisper model size (only used when provider="local").
+        whisper_model: Provider model name. For local, this is the Whisper model size.
         hf_token: HuggingFace token for pyannote diarization (only used when provider="local").
 
     Returns:
@@ -419,13 +419,18 @@ def transcribe(
         return handlers[provider](
             source,
             is_file=is_file,
-            model_size=whisper_model,
+            model_size=whisper_model or "base",
             hf_token=hf_token,
         )
-    return handlers[provider](source, is_file=is_file)
+    return handlers[provider](source, is_file=is_file, model=whisper_model)
 
 
-def transcribe_elevenlabs(source: str, *, is_file: bool = False) -> tuple[list[TranscriptSegment], float]:
+def transcribe_elevenlabs(
+    source: str,
+    *,
+    is_file: bool = False,
+    model: str | None = None,
+) -> tuple[list[TranscriptSegment], float]:
     """
     Transcribe audio via ElevenLabs Scribe API.
 
@@ -442,7 +447,7 @@ def transcribe_elevenlabs(source: str, *, is_file: bool = False) -> tuple[list[T
         sys.exit(1)
 
     data = {
-        "model_id": "scribe_v1",
+        "model_id": model or "scribe_v1",
         "diarize": "true",
         "timestamps_granularity": "word",
     }
@@ -621,14 +626,19 @@ def _openai_words(body: dict, offset: float) -> list[dict]:
     ]
 
 
-def transcribe_openai(source: str, *, is_file: bool = False) -> tuple[list[TranscriptSegment], float]:
+def transcribe_openai(
+    source: str,
+    *,
+    is_file: bool = False,
+    model: str | None = None,
+) -> tuple[list[TranscriptSegment], float]:
     """Transcribe audio with OpenAI's hosted Whisper endpoint in chunks."""
     api_key = _require_provider_api_key("openai")
     audio_path, owned_path = _audio_path_for_provider(source, is_file=is_file)
     chunk_dir = None
     try:
         chunk_dir, chunks = _prepare_openai_chunks(audio_path)
-        model = os.environ.get("OPENAI_TRANSCRIPTION_MODEL", "whisper-1")
+        model = model or "whisper-1"
         words: list[dict] = []
         offset = 0.0
         for index, chunk_path in enumerate(chunks, start=1):
@@ -703,7 +713,12 @@ def _assemblyai_segments(body: dict) -> list[TranscriptSegment]:
     return segments
 
 
-def transcribe_assemblyai(source: str, *, is_file: bool = False) -> tuple[list[TranscriptSegment], float]:
+def transcribe_assemblyai(
+    source: str,
+    *,
+    is_file: bool = False,
+    model: str | None = None,
+) -> tuple[list[TranscriptSegment], float]:
     """Transcribe and diarize audio with AssemblyAI."""
     api_key = _require_provider_api_key("assemblyai")
     audio_path, owned_path = _audio_path_for_provider(source, is_file=is_file)
@@ -721,7 +736,7 @@ def transcribe_assemblyai(source: str, *, is_file: bool = False) -> tuple[list[T
         audio_url = upload.json()["upload_url"]
 
         transcript_options = {"speaker_labels": True}
-        speech_model = os.environ.get("ASSEMBLYAI_SPEECH_MODEL")
+        speech_model = model
         if speech_model:
             transcript_options["speech_model"] = speech_model
         create = requests.post(
@@ -1149,11 +1164,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--search", metavar="QUERY", help="Search episodes by title/description")
     parser.add_argument("--latest", action="store_true", help="Transcribe the most recent episode (default)")
     parser.add_argument("--list", action="store_true", dest="list_episodes", help="List episodes without transcribing")
-    parser.add_argument("--output", metavar="FILE", help="Output filename (default: auto-generated)")
+    parser.add_argument(
+        "--output",
+        metavar="FILE",
+        default=os.environ.get("PODSCRIPT_OUTPUT") or None,
+        help="Output filename (default: auto-generated)",
+    )
     parser.add_argument(
         "--provider",
         choices=list(PROVIDER_SPECS),
-        default="elevenlabs",
+        default=os.environ.get("PODSCRIPT_PROVIDER") or "elevenlabs",
         help="Transcription backend (default: elevenlabs)",
     )
     parser.add_argument(
@@ -1163,19 +1183,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--model",
-        choices=["tiny", "base", "small", "medium", "large-v2", "large-v3"],
-        default="base",
-        help="Local Whisper model size (default: base). Only used with --provider local",
+        metavar="MODEL",
+        default=os.environ.get("PODSCRIPT_MODEL") or None,
+        help="Provider model name; blank uses the provider default",
     )
     parser.add_argument("--hf-token", metavar="TOKEN", help="HuggingFace token for pyannote speaker diarization")
     parser.add_argument(
         "--cookies-from-browser",
         metavar="BROWSER",
+        default=os.environ.get("PODSCRIPT_COOKIES_FROM_BROWSER") or None,
         help="Use cookies from a browser for YouTube (e.g. chrome, firefox)",
     )
     parser.add_argument(
         "--js-runtime",
         metavar="RUNTIME",
+        default=os.environ.get("PODSCRIPT_JS_RUNTIME") or None,
         help="JavaScript runtime for YouTube extraction (e.g. deno, bun)",
     )
     return parser

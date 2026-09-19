@@ -20,7 +20,7 @@ pip install podscript
 podscript --setup  # paste your ElevenLabs API key
 ```
 
-For local mode, just add `--local` to any command. For ElevenLabs, you'll need an [API key](https://elevenlabs.io/app/settings/api-keys).
+For local mode, set `PODSCRIPT_PROVIDER=local` in `.env` or add `--local` to a command. For ElevenLabs, you'll need an [API key](https://elevenlabs.io/app/settings/api-keys).
 
 For YouTube support, also install [yt-dlp](https://github.com/yt-dlp/yt-dlp) and both `ffmpeg` and `ffprobe` from [FFmpeg](https://ffmpeg.org/). `imageio-ffmpeg` alone is not sufficient because it does not provide `ffprobe`.
 
@@ -52,20 +52,32 @@ If `podscript` is not found, run `source .venv/bin/activate` from the repository
 
 `.env` is loaded automatically from the repository directory. Fill in only the API key for the provider you plan to use. Keep `.env` private; it is ignored by Git.
 
+You can also put the normal command defaults in `.env`:
+
+```env
+PODSCRIPT_PROVIDER=assemblyai
+PODSCRIPT_MODEL=
+PODSCRIPT_COOKIES_FROM_BROWSER=firefox
+PODSCRIPT_JS_RUNTIME=bun
+PODSCRIPT_OUTPUT=
+```
+
+Leave a setting blank to use the normal default. Then a YouTube transcription only needs:
+
+```bash
+podscript "https://www.youtube.com/watch?v=VIDEO_ID"
+```
+
+Command-line flags still override `.env` values.
+
 ## Usage
 
 ```bash
 # Transcribe a podcast from an Apple Podcasts link
 podscript "https://podcasts.apple.com/us/podcast/huberman-lab/id1545953110?i=1000690"
 
-# Transcribe a YouTube video
+# Transcribe a YouTube video using the settings in .env
 podscript "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
-
-# Use AssemblyAI for long videos and hosted speaker diarization
-podscript "https://www.youtube.com/watch?v=..." --provider assemblyai
-
-# Use OpenAI hosted transcription without local GPU memory
-podscript "https://www.youtube.com/watch?v=..." --provider openai
 
 # Use an RSS feed directly
 podscript https://feeds.simplecast.com/JGE3yC0V
@@ -96,6 +108,8 @@ Provider API keys are read from environment variables. The application does not 
 | ElevenLabs | `--provider elevenlabs` | `ELEVENLABS_API_KEY` | Yes | Hosted transcription |
 | Local Whisper | `--provider local` or `--local` | Optional `HF_TOKEN` for pyannote | Optional, local pyannote | Uses local GPU/CPU memory |
 
+Set `PODSCRIPT_MODEL` when you want a specific model. Leave it blank to use the provider default. Examples include `universal-3-pro` for AssemblyAI, `whisper-1` for OpenAI, `scribe_v1` for ElevenLabs, and `base`, `small`, or `medium` for local Whisper.
+
 Set the key for the provider you choose:
 
 ```bash
@@ -106,27 +120,37 @@ export OPENAI_API_KEY="..."
 export ELEVENLABS_API_KEY="..."
 ```
 
-For a long YouTube video on a small GPU, prefer AssemblyAI:
+For a long YouTube video on a small GPU, set these values in `.env`:
+
+```env
+PODSCRIPT_PROVIDER=assemblyai
+PODSCRIPT_MODEL=universal-3-pro
+PODSCRIPT_COOKIES_FROM_BROWSER=chrome
+PODSCRIPT_JS_RUNTIME=bun
+PODSCRIPT_OUTPUT=transcript.md
+```
+
+Then run:
 
 ```bash
-source .venv/bin/activate
-export ASSEMBLYAI_API_KEY="..."
-podscript "https://www.youtube.com/watch?v=..." \
-  --provider assemblyai \
-  --cookies-from-browser chrome \
-  --js-runtime bun \
-  --output transcript.md
+podscript "https://www.youtube.com/watch?v=..."
 ```
 
 This path does not load Whisper or pyannote, so the local GPU out-of-memory failure cannot occur. AssemblyAI's speaker labels are normalized into Podscript's `Speaker 1`, `Speaker 2`, and so on.
 
 OpenAI's hosted Whisper path avoids GPU use and automatically chunks audio before upload:
 
+Set these values in `.env`:
+
+```env
+PODSCRIPT_PROVIDER=openai
+PODSCRIPT_MODEL=whisper-1
+```
+
+Then run:
+
 ```bash
-export OPENAI_API_KEY="..."
-podscript "https://www.youtube.com/watch?v=..." \
-  --provider openai \
-  --output transcript.md
+podscript "https://www.youtube.com/watch?v=..."
 ```
 
 OpenAI's standard Whisper endpoint returns timestamps but not speaker identities, so output is labeled `Speaker 1`.
@@ -167,23 +191,22 @@ This installs `faster-whisper`, `pyannote.audio`, and `torch`.
 ### Usage
 
 ```bash
-# Basic local transcription (uses "base" model, no speaker diarization)
-podscript "https://www.youtube.com/watch?v=..." --provider local
+# Set PODSCRIPT_PROVIDER=local in .env for local transcription
+podscript "https://www.youtube.com/watch?v=..."
 
 # Use a larger model for better accuracy
-podscript "https://www.youtube.com/watch?v=..." --provider local --model medium
+podscript "https://www.youtube.com/watch?v=..." --model medium
 
 # If YouTube asks you to sign in or returns HTTP 429, use browser cookies
 # and a JavaScript runtime. Close the browser first.
-podscript "https://www.youtube.com/watch?v=..." --local \
-  --cookies-from-browser chrome --js-runtime bun
+podscript "https://www.youtube.com/watch?v=..."
 
 # Enable speaker diarization with a HuggingFace token
-podscript "https://feeds.example.com/rss" --local --hf-token hf_xxxxx
+podscript "https://feeds.example.com/rss"
 
 # Or set the token as an environment variable once
 export HF_TOKEN=hf_xxxxx
-podscript "https://feeds.example.com/rss" --local
+podscript "https://feeds.example.com/rss"
 ```
 
 ### Model Sizes
@@ -221,14 +244,10 @@ Use a browser session that is signed in to YouTube:
 
 ```bash
 source .venv/bin/activate
-podscript "https://www.youtube.com/watch?v=..." \
-  --local \
-  --cookies-from-browser chrome \
-  --js-runtime bun \
-  --output transcript.md
+podscript "https://www.youtube.com/watch?v=..."
 ```
 
-Replace `chrome` with `chromium`, `firefox`, `brave`, or `edge` as appropriate. Close the browser before running the command so yt-dlp can read its cookie database. Never paste cookie contents or access tokens into an issue or commit.
+Set `PODSCRIPT_COOKIES_FROM_BROWSER` to `chrome`, `chromium`, `firefox`, `brave`, or `edge` in `.env`. Set `PODSCRIPT_JS_RUNTIME=bun` for the JavaScript challenge solver. Close the browser before running the command so yt-dlp can read its cookie database. Never paste cookie contents or access tokens into an issue or commit.
 
 Recent yt-dlp versions also use an external JavaScript challenge solver. Podscript automatically enables the official `ejs:github` remote component for YouTube downloads. If you invoke yt-dlp directly, add `--remote-components ejs:github`.
 
