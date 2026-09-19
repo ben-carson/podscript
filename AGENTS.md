@@ -18,9 +18,9 @@ podscript --help
 
 The local transcription stack requires `faster-whisper`, `pyannote.audio`, and `torch`. YouTube support additionally requires `yt-dlp`, `ffmpeg`, and `ffprobe`. `imageio-ffmpeg` provides only `ffmpeg`; it does not satisfy yt-dlp's `ffprobe` requirement.
 
-Hosted providers use the existing `requests` dependency and do not require provider SDKs. `ASSEMBLYAI_API_KEY`, `OPENAI_API_KEY`, and `ELEVENLABS_API_KEY` must never be printed or committed.
+Hosted providers use the existing `requests` dependency and do not require provider SDKs. `ASSEMBLYAI_API_KEY`, `DEEPGRAM_API_KEY`, `OPENAI_API_KEY`, and `ELEVENLABS_API_KEY` must never be printed or committed.
 
-The `.env` file may set `PODSCRIPT_PROVIDER`, `PODSCRIPT_MODEL`, `PODSCRIPT_COOKIES_FROM_BROWSER`, `PODSCRIPT_JS_RUNTIME`, and `PODSCRIPT_OUTPUT`. Empty values preserve defaults. CLI flags override these settings. Model names are provider-specific.
+The `.env` file may set `PODSCRIPT_PROVIDER`, `PODSCRIPT_MODEL`, `PODSCRIPT_COOKIES_FROM_BROWSER`, `PODSCRIPT_JS_RUNTIME`, `PODSCRIPT_OUTPUT`, and `PODSCRIPT_OUTPUT_DIR`. Empty values preserve defaults. Auto-generated filenames use the source name in brackets before the title; `PODSCRIPT_OUTPUT_DIR` applies only to these auto-generated names, and an explicit output path takes precedence. CLI flags override these settings. Model names are provider-specific.
 
 On Linux, ctranslate2/faster-whisper may require CUDA 12 libraries even when the installed PyTorch wheel uses CUDA 13. In the validated working environment, `nvidia-cublas-cu12` and `nvidia-cuda-runtime-cu12` were installed manually, and `_configure_cuda_library_path()` exposes virtual-environment CUDA libraries before native Whisper libraries load. Fresh installs may need those packages when GPU loading reports a missing `libcublas.so.12`. Do not remove that setup without testing both CPU and GPU paths.
 
@@ -28,7 +28,7 @@ On Linux, ctranslate2/faster-whisper may require CUDA 12 libraries even when the
 
 The YouTube path first asks yt-dlp for metadata, then downloads and converts audio to MP3 before transcription. Failures during metadata lookup are YouTube/yt-dlp failures, not Whisper failures. Before pyannote diarization, convert the downloaded audio to temporary mono 16 kHz PCM WAV; passing MP3 directly can produce one-sample boundary mismatches on 10-second chunks. Release the Whisper model and clear the CUDA cache before pyannote runs; both models cannot reliably coexist on smaller GPUs.
 
-For long videos or GPUs with limited VRAM, prefer `--provider assemblyai`. AssemblyAI handles hosted transcription and speaker diarization without loading local Whisper or pyannote. The OpenAI provider avoids local GPU use and chunks audio into ten-minute uploads, but standard OpenAI Whisper output has no speaker labels. Hosted provider calls should remain lazy so local-only users do not need provider SDKs.
+For long videos or GPUs with limited VRAM, prefer `--provider assemblyai` or `--provider deepgram`. Both handle hosted transcription and speaker diarization without loading local Whisper or pyannote. The OpenAI provider avoids local GPU use and chunks audio into ten-minute uploads, but standard OpenAI Whisper output has no speaker labels. Hosted provider calls should remain lazy so local-only users do not need provider SDKs.
 
 Some videos trigger HTTP 429 or JavaScript challenges while others work without authentication. For protected videos, use a signed-in browser session:
 

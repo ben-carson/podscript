@@ -28,6 +28,7 @@ ELEVENLABS_API_URL = "https://api.elevenlabs.io/v1/speech-to-text"
 OPENAI_API_URL = "https://api.openai.com/v1/audio/transcriptions"
 ASSEMBLYAI_UPLOAD_URL = "https://api.assemblyai.com/v2/upload"
 ASSEMBLYAI_TRANSCRIPT_URL = "https://api.assemblyai.com/v2/transcript"
+DEEPGRAM_LISTEN_URL = "https://api.deepgram.com/v1/listen"
 OPENAI_CHUNK_SECONDS = 600
 PAUSE_THRESHOLD = 1.0  # seconds - gap that triggers new segment
 
@@ -65,6 +66,7 @@ PROVIDER_SPECS = {
     "elevenlabs": ProviderSpec("elevenlabs", "ElevenLabs Scribe", "ELEVENLABS_API_KEY", True),
     "openai": ProviderSpec("openai", "OpenAI transcription", "OPENAI_API_KEY", False),
     "assemblyai": ProviderSpec("assemblyai", "AssemblyAI", "ASSEMBLYAI_API_KEY", True),
+    "deepgram": ProviderSpec("deepgram", "Deepgram", "DEEPGRAM_API_KEY", True),
 }
 
 
@@ -83,10 +85,29 @@ def format_timestamp(seconds: float) -> str:
 
 
 def sanitize_filename(name: str) -> str:
-    """Strip non-alphanumeric chars, collapse whitespace to hyphens, max 80 chars."""
-    name = re.sub(r"[^a-zA-Z0-9\s-]", "", name)
+    """Keep alphanumerics and brackets, collapse whitespace to hyphens, max 80 chars."""
+    name = re.sub(r"[^a-zA-Z0-9\s\-\[\]]", "", name)
     name = re.sub(r"\s+", "-", name).strip("-")
     return name[:80]
+
+
+def build_output_path(
+    title: str,
+    *,
+    source_name: str | None = None,
+    explicit_output: str | None = None,
+    output_dir: str | None = None,
+) -> Path:
+    """Build the output path, prefixing auto-names with the source name."""
+    if explicit_output:
+        path = Path(explicit_output).expanduser()
+    else:
+        auto_name = f"[{source_name}] {title}" if source_name else title
+        path = Path(f"{sanitize_filename(auto_name)}.md")
+        if output_dir:
+            path = Path(output_dir).expanduser() / path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
 
 
 def clean_html(text: str) -> str:
@@ -411,6 +432,7 @@ def transcribe(
         "elevenlabs": transcribe_elevenlabs,
         "openai": transcribe_openai,
         "assemblyai": transcribe_assemblyai,
+        "deepgram": transcribe_deepgram,
     }
     if provider not in handlers:
         supported = ", ".join(handlers)
@@ -732,20 +754,33 @@ def transcribe_assemblyai(
                 data=audio_file,
                 timeout=1800,
             )
-        upload.raise_for_status()
+        if upload.status_code >= 400:
+            print(
+                f"AssemblyAI upload error ({upload.status_code}): {upload.text}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         audio_url = upload.json()["upload_url"]
 
-        transcript_options = {"speaker_labels": True}
-        speech_model = model
-        if speech_model:
-            transcript_options["speech_model"] = speech_model
+        # The current pre-recorded API requires speech_models (plural).
+        # Universal-3.5 Pro is the current default for this integration.
+        speech_model = model or "universal-3-5-pro"
+        transcript_options = {
+            "speech_models": [speech_model],
+            "speaker_labels": True,
+        }
         create = requests.post(
             ASSEMBLYAI_TRANSCRIPT_URL,
             headers={**headers, "content-type": "application/json"},
             json={"audio_url": audio_url, **transcript_options},
             timeout=120,
         )
-        create.raise_for_status()
+        if create.status_code >= 400:
+            print(
+                f"AssemblyAI transcript error ({create.status_code}): {create.text}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         transcript_id = create.json()["id"]
         poll_url = f"{ASSEMBLYAI_TRANSCRIPT_URL}/{transcript_id}"
         poll_interval = float(os.environ.get("ASSEMBLYAI_POLL_INTERVAL", "5"))
@@ -753,7 +788,12 @@ def transcribe_assemblyai(
         while True:
             time.sleep(poll_interval)
             result = requests.get(poll_url, headers=headers, timeout=120)
-            result.raise_for_status()
+            if result.status_code >= 400:
+                print(
+                    f"AssemblyAI polling error ({result.status_code}): {result.text}",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
             body = result.json()
             status = body.get("status")
             if status == "completed":
@@ -762,6 +802,119 @@ def transcribe_assemblyai(
                 return segments, duration
             if status == "error":
                 raise RuntimeError(f"AssemblyAI transcription failed: {body.get('error', 'unknown error')}")
+    finally:
+        if owned_path:
+            try:
+                os.unlink(owned_path)
+            except OSError:
+                pass
+
+
+def _deepgram_speaker_id(value, speakers: dict[str, str]) -> str:
+    """Normalize Deepgram speaker labels into Podscript speaker IDs."""
+    label = str(value if value is not None else 0)
+    if label not in speakers:
+        speakers[label] = f"speaker_{len(speakers)}"
+    return speakers[label]
+
+
+def _deepgram_words(items: list[dict], default_speaker, speakers: dict[str, str]) -> list[dict]:
+    """Normalize Deepgram word timestamps and speaker labels."""
+    speaker_id = _deepgram_speaker_id(default_speaker, speakers)
+    return [
+        {
+            "text": (word.get("punctuated_word") or word.get("word", "")).strip(),
+            "start": float(word.get("start", 0)),
+            "end": float(word.get("end", 0)),
+            "speaker_id": _deepgram_speaker_id(word.get("speaker", default_speaker), speakers),
+        }
+        for word in items
+        if word.get("punctuated_word") or word.get("word")
+    ] or [
+        {
+            "text": "",
+            "start": 0.0,
+            "end": 0.0,
+            "speaker_id": speaker_id,
+        }
+    ]
+
+
+def _deepgram_segments(body: dict) -> list[TranscriptSegment]:
+    """Normalize Deepgram utterances or channel word timestamps."""
+    results = body.get("results") or {}
+    speakers: dict[str, str] = {}
+    segments: list[TranscriptSegment] = []
+
+    for utterance in results.get("utterances") or []:
+        words = _deepgram_words(
+            utterance.get("words") or [],
+            utterance.get("speaker", 0),
+            speakers,
+        )
+        words = [word for word in words if word["text"]]
+        if words:
+            segments.extend(group_into_segments(words))
+        elif utterance.get("transcript"):
+            segments.append(
+                TranscriptSegment(
+                    speaker=_deepgram_speaker_id(utterance.get("speaker", 0), speakers),
+                    text=utterance["transcript"].strip(),
+                    start=float(utterance.get("start", 0)),
+                    end=float(utterance.get("end", 0)),
+                )
+            )
+
+    if segments:
+        return segments
+
+    channels = results.get("channels") or []
+    if not channels:
+        return []
+    alternative = (channels[0].get("alternatives") or [{}])[0]
+    words = _deepgram_words(alternative.get("words") or [], 0, speakers)
+    return group_into_segments([word for word in words if word["text"]])
+
+
+def transcribe_deepgram(
+    source: str,
+    *,
+    is_file: bool = False,
+    model: str | None = None,
+) -> tuple[list[TranscriptSegment], float]:
+    """Transcribe and diarize audio with Deepgram's prerecorded API."""
+    api_key = _require_provider_api_key("deepgram")
+    audio_path, owned_path = _audio_path_for_provider(source, is_file=is_file)
+    try:
+        print("Uploading audio to Deepgram...")
+        with open(audio_path, "rb") as audio_file:
+            response = requests.post(
+                DEEPGRAM_LISTEN_URL,
+                params={
+                    "model": model or "nova-3",
+                    "diarize": "true",
+                    "utterances": "true",
+                    "words": "true",
+                    "punctuate": "true",
+                    "smart_format": "true",
+                },
+                headers={
+                    "Authorization": f"Token {api_key}",
+                    "Content-Type": "audio/mpeg",
+                },
+                data=audio_file,
+                timeout=1800,
+            )
+        if response.status_code >= 400:
+            print(
+                f"Deepgram transcription error ({response.status_code}): {response.text}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        body = response.json()
+        segments = _deepgram_segments(body)
+        duration = float((body.get("metadata") or {}).get("duration") or 0)
+        return segments, duration
     finally:
         if owned_path:
             try:
@@ -1171,6 +1324,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output filename (default: auto-generated)",
     )
     parser.add_argument(
+        "--output-dir",
+        metavar="DIRECTORY",
+        default=os.environ.get("PODSCRIPT_OUTPUT_DIR") or None,
+        help="Directory for auto-generated output filenames",
+    )
+    parser.add_argument(
         "--provider",
         choices=list(PROVIDER_SPECS),
         default=os.environ.get("PODSCRIPT_PROVIDER") or "elevenlabs",
@@ -1282,8 +1441,13 @@ def main():
         print(f"Segments: {len(segments)}")
 
         md = generate_markdown(yt["title"], yt["channel"], segments, duration)
-        filename = args.output or f"{sanitize_filename(yt['title'])}.md"
-        Path(filename).write_text(md, encoding="utf-8")
+        filename = build_output_path(
+            yt["title"],
+            source_name=yt["channel"],
+            explicit_output=args.output,
+            output_dir=args.output_dir,
+        )
+        filename.write_text(md, encoding="utf-8")
         print(f"\nSaved to: {filename}")
         return
 
@@ -1453,8 +1617,13 @@ def main():
     print(f"Segments: {len(segments)}")
 
     md = generate_markdown(selected.title, podcast_name, segments, duration)
-    filename = args.output or f"{sanitize_filename(selected.title)}.md"
-    Path(filename).write_text(md, encoding="utf-8")
+    filename = build_output_path(
+        selected.title,
+        source_name=podcast_name,
+        explicit_output=args.output,
+        output_dir=args.output_dir,
+    )
+    filename.write_text(md, encoding="utf-8")
     print(f"\nSaved to: {filename}")
 
 

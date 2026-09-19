@@ -60,6 +60,7 @@ PODSCRIPT_MODEL=
 PODSCRIPT_COOKIES_FROM_BROWSER=firefox
 PODSCRIPT_JS_RUNTIME=bun
 PODSCRIPT_OUTPUT=
+PODSCRIPT_OUTPUT_DIR=
 ```
 
 Leave a setting blank to use the normal default. Then a YouTube transcription only needs:
@@ -68,7 +69,7 @@ Leave a setting blank to use the normal default. Then a YouTube transcription on
 podscript "https://www.youtube.com/watch?v=VIDEO_ID"
 ```
 
-Command-line flags still override `.env` values.
+`PODSCRIPT_OUTPUT_DIR` applies to automatically generated filenames, which use the source name in brackets before the title, such as `[IndyDevDan]-The-Pi-Coding-Agent.md`. `PODSCRIPT_OUTPUT` still takes precedence when you want an exact filename. Command-line flags override `.env` values.
 
 ## Usage
 
@@ -104,16 +105,19 @@ Provider API keys are read from environment variables. The application does not 
 | Provider | Flag | Environment variable | Speaker diarization | Long-video behavior |
 |---|---|---|---|---|
 | AssemblyAI | `--provider assemblyai` | `ASSEMBLYAI_API_KEY` | Yes, hosted | Uploads the full audio and polls for completion |
+| Deepgram | `--provider deepgram` | `DEEPGRAM_API_KEY` | Yes, hosted | Uploads the full audio |
 | OpenAI | `--provider openai` | `OPENAI_API_KEY` | No with the standard Whisper endpoint | Splits audio into ten-minute chunks |
 | ElevenLabs | `--provider elevenlabs` | `ELEVENLABS_API_KEY` | Yes | Hosted transcription |
 | Local Whisper | `--provider local` or `--local` | Optional `HF_TOKEN` for pyannote | Optional, local pyannote | Uses local GPU/CPU memory |
 
-Set `PODSCRIPT_MODEL` when you want a specific model. Leave it blank to use the provider default. Examples include `universal-3-pro` for AssemblyAI, `whisper-1` for OpenAI, `scribe_v1` for ElevenLabs, and `base`, `small`, or `medium` for local Whisper.
+Set `PODSCRIPT_MODEL` when you want a specific model. Leave it blank to use the provider default. Examples include `universal-3-5-pro` for AssemblyAI, `nova-3` for Deepgram, `whisper-1` for OpenAI, `scribe_v1` for ElevenLabs, and `base`, `small`, or `medium` for local Whisper.
 
 Set the key for the provider you choose:
 
 ```bash
 export ASSEMBLYAI_API_KEY="..."
+# or:
+export DEEPGRAM_API_KEY="..."
 # or:
 export OPENAI_API_KEY="..."
 # or:
@@ -124,10 +128,11 @@ For a long YouTube video on a small GPU, set these values in `.env`:
 
 ```env
 PODSCRIPT_PROVIDER=assemblyai
-PODSCRIPT_MODEL=universal-3-pro
+PODSCRIPT_MODEL=universal-3-5-pro
 PODSCRIPT_COOKIES_FROM_BROWSER=chrome
 PODSCRIPT_JS_RUNTIME=bun
-PODSCRIPT_OUTPUT=transcript.md
+PODSCRIPT_OUTPUT=
+PODSCRIPT_OUTPUT_DIR=transcripts
 ```
 
 Then run:
@@ -154,6 +159,13 @@ podscript "https://www.youtube.com/watch?v=..."
 ```
 
 OpenAI's standard Whisper endpoint returns timestamps but not speaker identities, so output is labeled `Speaker 1`.
+
+Deepgram's hosted path also returns word timestamps and speaker labels without using local GPU memory:
+
+```env
+PODSCRIPT_PROVIDER=deepgram
+PODSCRIPT_MODEL=nova-3
+```
 
 ## Output
 
